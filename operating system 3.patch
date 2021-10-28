@@ -1,0 +1,831 @@
+diff --git a/Makefile b/Makefile
+index 43e152f..0d5539a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -50,6 +50,10 @@ endif
+ 
+ QEMU = qemu-system-riscv64
+ 
++ifndef SELECTION
++SELECTION := SCFIFO
++endif
++
+ CC = $(TOOLPREFIX)gcc
+ AS = $(TOOLPREFIX)gas
+ LD = $(TOOLPREFIX)ld
+@@ -62,6 +66,7 @@ CFLAGS += -mcmodel=medany
+ CFLAGS += -ffreestanding -fno-common -nostdlib -mno-relax
+ CFLAGS += -I.
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
++CFLAGS += -D $(SELECTION)
+ 
+ # Disable PIE when possible (for Ubuntu 16.10 toolchain)
+ ifneq ($(shell $(CC) -dumpspecs 2>/dev/null | grep -e '[^f]no-pie'),)
+@@ -133,6 +138,7 @@ UPROGS=\
+ 	$U/_wc\
+ 	$U/_zombie\
+ 	$U/_lazytests\
++	$U/_test\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+diff --git a/kernel/defs.h b/kernel/defs.h
+index b7802e0..33c69e8 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -110,6 +110,7 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++void            updateINFO(void);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+@@ -155,6 +156,7 @@ void            trapinit(void);
+ void            trapinithart(void);
+ extern struct spinlock tickslock;
+ void            usertrapret(void);
++void            pageFault(uint64 va, pte_t *pte);
+ 
+ // uart.c
+ void            uartinit(void);
+@@ -167,7 +169,7 @@ int             uartgetc(void);
+ void            kvminit(void);
+ void            kvminithart(void);
+ void            kvmmap(pagetable_t, uint64, uint64, uint64, int);
+-int             mappages(pagetable_t, uint64, uint64, uint64, int);
++int             mappages(pagetable_t, uint64, uint64, uint64, int, int);
+ pagetable_t     uvmcreate(void);
+ void            uvminit(pagetable_t, uchar *, uint);
+ uint64          uvmalloc(pagetable_t, uint64, uint64);
+@@ -177,9 +179,19 @@ void            uvmfree(pagetable_t, uint64);
+ void            uvmunmap(pagetable_t, uint64, uint64, int);
+ void            uvmclear(pagetable_t, uint64);
+ uint64          walkaddr(pagetable_t, uint64);
++pte_t *         walk(pagetable_t pagetable, uint64 va, int alloc);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++int             createTime();
++
++int             aSCFIFO(void);
++int             aLAPA(void);
++int             aNFUA(void);
++int             countSetBits(uint n);
++int             isNONEAlgo(void);
++void            updateCounter(struct proc *);
++
+ 
+ // plic.c
+ void            plicinit(void);
+@@ -194,3 +206,6 @@ void            virtio_disk_intr(void);
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
++#define MAX_PSYC_PAGES 16
++#define MAX_TOTAL_PAGES 32
++#define PTE_PG (1L << 9) // Paged out to secondary storage 
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 0e8762f..224fcb7 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -102,6 +102,29 @@ exec(char *path, char **argv)
+   // value, which goes in a0.
+   p->trapframe->a1 = sp;
+ 
++  #ifndef NONE
++    if(p->pid > 2) {
++      for (int i = 0; i < MAX_PSYC_PAGES; i++){
++        p->ram[i].adress = UNUSED;
++        p->ram[i].state = UNUSED;
++        p->swaps[i].adress = UNUSED;
++        p->swaps[i].state = UNUSED;
++      }     
++      for(uint i =0, a = 0; a < sz; a += PGSIZE, i ++){
++        p->ram[i].adress = a;
++        p->ram[i].state = USED;
++        #if LAPA
++          p->ram[i].accesscounter = 0xFFFFFFFF;
++        #endif
++        #if NFUA
++          p->ram[i].accesscounter = 0;
++        #endif
++        p->ram[i].creationTime = createTime();
++      }
++      if(removeSwapFile(p) == -1 || createSwapFile(p) == -1)
++        panic("Fail");
++    }
++  #endif
+   // Save program name for debugging.
+   for(last=s=path; *s; s++)
+     if(*s == '/')
+diff --git a/kernel/param.h b/kernel/param.h
+index b5fdcb2..a6a5179 100644
+--- a/kernel/param.h
++++ b/kernel/param.h
+@@ -11,3 +11,6 @@
+ #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
+ #define FSSIZE       1000  // size of file system in blocks
+ #define MAXPATH      128   // maximum file path name
++
++#define MAX_PSYC_PAGES 16
++#define MAX_TOTAL_PAGES 32
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 22e7ce4..4254727 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -141,6 +141,21 @@ found:
+   p->context.ra = (uint64)forkret;
+   p->context.sp = p->kstack + PGSIZE;
+ 
++  #ifndef NONE
++    if (p->pid > 2) {
++      release(&p->lock);
++      createSwapFile(p);
++      acquire(&p->lock);
++    }
++  #endif
++  for (int i = 0 ; i<MAX_PSYC_PAGES; i++){
++      #if LAPA
++        p->ram[i].accesscounter = 0xFFFFFFFF;
++      #endif
++      #if NFUA
++        p->ram[i].accesscounter = 0;
++  #endif
++  }
+   return p;
+ }
+ 
+@@ -157,15 +172,24 @@ freeproc(struct proc *p)
+     proc_freepagetable(p->pagetable, p->sz);
+   p->pagetable = 0;
+   p->sz = 0;
+-  p->pid = 0;
+   p->parent = 0;
+   p->name[0] = 0;
+   p->chan = 0;
+   p->killed = 0;
+   p->xstate = 0;
+   p->state = UNUSED;
+-}
++  #ifndef NONE
++    if(p->pid > 2) {
++      for (int i = 0; i < MAX_PSYC_PAGES; i++){
++        p->ram[i].adress = UNUSED;
++        p->ram[i].state = UNUSED;
++        p->swaps[i].adress = UNUSED;
++        p->swaps[i].state = UNUSED;
++      }
++    }
++  #endif
+ 
++}
+ // Create a user page table for a given process,
+ // with no user memory, but with trampoline pages.
+ pagetable_t
+@@ -183,14 +207,14 @@ proc_pagetable(struct proc *p)
+   // only the supervisor uses it, on the way
+   // to/from user space, so not PTE_U.
+   if(mappages(pagetable, TRAMPOLINE, PGSIZE,
+-              (uint64)trampoline, PTE_R | PTE_X) < 0){
++              (uint64)trampoline, PTE_R | PTE_X, REG_MAP) < 0){
+     uvmfree(pagetable, 0);
+     return 0;
+   }
+ 
+   // map the trapframe just below TRAMPOLINE, for trampoline.S.
+   if(mappages(pagetable, TRAPFRAME, PGSIZE,
+-              (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
++              (uint64)(p->trapframe), PTE_R | PTE_W, REG_MAP) < 0){
+     uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+     uvmfree(pagetable, 0);
+     return 0;
+@@ -269,6 +293,7 @@ growproc(int n)
+ 
+ // Create a new process, copying the parent.
+ // Sets up child kernel stack to return as if from fork() system call.
++static char global_buff[PGSIZE*MAX_PSYC_PAGES];
+ int
+ fork(void)
+ {
+@@ -295,6 +320,26 @@ fork(void)
+   // Cause fork to return 0 in the child.
+   np->trapframe->a0 = 0;
+ 
++  #ifndef NONE
++    int swapSize = 0;
++    if(p->pid > 2) {
++      for (int i = 0; i < MAX_PSYC_PAGES; i++){
++        np->swaps[i].adress = p->swaps[i].adress;
++        np->swaps[i].state = p->swaps[i].state;
++        np->ram[i].adress = p->ram[i].adress;
++        np->ram[i].state = p->ram[i].state;
++        np->ram[i].creationTime = p->ram[i].creationTime;
++        np->swaps[i].accesscounter = p->swaps[i].accesscounter;
++        if(p->swaps[i].state == USED)
++          swapSize++;
++      }
++      release(&np->lock);
++      if(readFromSwapFile(p, global_buff, 0, swapSize*PGSIZE) == -1|| 
++          writeToSwapFile(np, global_buff, 0, swapSize*PGSIZE) == -1)
++        panic("Fail");
++      acquire(&np->lock);
++    }
++  #endif
+   // increment reference counts on open file descriptors.
+   for(i = 0; i < NOFILE; i++)
+     if(p->ofile[i])
+@@ -357,7 +402,10 @@ exit(int status)
+   iput(p->cwd);
+   end_op();
+   p->cwd = 0;
+-
++  #ifndef NONE
++    if(p->pid > 2)
++      removeSwapFile(p);
++  #endif
+   acquire(&wait_lock);
+ 
+   // Give any children to init.
+@@ -626,6 +674,17 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
+   }
+ }
+ 
++void updateINFO(){
++ struct proc *p;
++  for(p = proc; p < &proc[NPROC]; p++){
++    acquire(&p->lock);
++    if (p->pid > 2 && p->state > 1 && p->state < 5) //proc is either running, runnable or sleeping
++      updateCounter(p); //implemented in vm.c
++        release(&p->lock);
++  }
++
++}
++
+ // Print a process listing to console.  For debugging.
+ // Runs when user types ^P on console.
+ // No lock to avoid wedging a stuck machine further.
+diff --git a/kernel/proc.h b/kernel/proc.h
+index c007999..04ca815 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -1,3 +1,9 @@
++#define MAX_PSYC_PAGES 16
++#define MAX_TOTAL_PAGES 32
++#define PTE_PG (1L << 9) // Paged out to secondary storage 
++#define REG_MAP 1
++#define SPEC_MAP 0
++
+ // Saved registers for kernel context switches.
+ struct context {
+   uint64 ra;
+@@ -82,6 +88,17 @@ struct trapframe {
+ 
+ enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
+ 
++// Q1
++struct page {
++  int state;      
++  uint64 adress;    //addr of VA
++  pagetable_t pagetable;   
++  uint offsetInSF;
++  int accesscounter; 
++  uint creationTime;
++};
++
++
+ // Per-process state
+ struct proc {
+   struct spinlock lock;
+@@ -107,4 +124,7 @@ struct proc {
+   char name[16];               // Process name (debugging)
+ 
+   struct file *swapFile;
++  
++  struct page ram[MAX_PSYC_PAGES];
++  struct page swaps[MAX_PSYC_PAGES];  
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 0aec003..5a92078 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -332,6 +332,11 @@ sfence_vma()
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // 1 -> user can access
+ 
++#define PTE_A (1L << 6)
++
++
++#define PTE_PG (1L << 9) 
++
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+ 
+diff --git a/kernel/trap.c b/kernel/trap.c
+index a63249e..88c964e 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -67,12 +67,23 @@ usertrap(void)
+     syscall();
+   } else if((which_dev = devintr()) != 0){
+     // ok
+-  } else {
++  } 
++  else {
++    #ifndef NONE
++      if(p->pid > 2 && (r_scause() == 12) | (r_scause() == 13) | (r_scause() == 15)) {
++        uint64 a = PGROUNDDOWN(r_stval());
++        pte_t *pte = walk(p->pagetable, a, 0);
++        if(*pte & PTE_PG) {
++          pageFault(a, pte);
++          goto cont;
++        }
++      }
++    #endif
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+     p->killed = 1;
+   }
+-
++cont:
+   if(p->killed)
+     exit(-1);
+ 
+@@ -206,6 +217,12 @@ devintr()
+ 
+     if(cpuid() == 0){
+       clockintr();
++      #if LAPA
++        updateINFO(); 
++      #endif
++      #if NFUA
++        updateINFO();
++      #endif
+     }
+     
+     // acknowledge the software interrupt by clearing
+diff --git a/kernel/vm.c b/kernel/vm.c
+index b47f111..198190b 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -5,7 +5,14 @@
+ #include "riscv.h"
+ #include "defs.h"
+ #include "fs.h"
+-
++#include "spinlock.h"
++#include "proc.h"
++int createTime();
++int findpagetoswap();
++int ramIntoDisc(struct proc *p, int swapI);
++int EmptyRoomOnRam(struct proc* p);
++int EmptyRoomToSwap(struct proc* p);
++static char global_buff[PGSIZE];
+ /*
+  * the kernel's page table.
+  */
+@@ -126,7 +133,7 @@ walkaddr(pagetable_t pagetable, uint64 va)
+ void
+ kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
+ {
+-  if(mappages(kpgtbl, va, sz, pa, perm) != 0)
++  if(mappages(kpgtbl, va, sz, pa, perm, REG_MAP) != 0)
+     panic("kvmmap");
+ }
+ 
+@@ -135,7 +142,7 @@ kvmmap(pagetable_t kpgtbl, uint64 va, uint64 pa, uint64 sz, int perm)
+ // be page-aligned. Returns 0 on success, -1 if walk() couldn't
+ // allocate a needed page-table page.
+ int
+-mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
++mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm, int state)
+ {
+   uint64 a, last;
+   pte_t *pte;
+@@ -143,7 +150,7 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+   a = PGROUNDDOWN(va);
+   last = PGROUNDDOWN(va + size - 1);
+   for(;;){
+-    if((pte = walk(pagetable, a, 1)) == 0)
++    if((pte = walk(pagetable, a, state)) == 0)
+       return -1;
+     if(*pte & PTE_V)
+       panic("remap");
+@@ -152,6 +159,8 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
+       break;
+     a += PGSIZE;
+     pa += PGSIZE;
++    if (state == SPEC_MAP)
++      break;
+   }
+   return 0;
+ }
+@@ -172,15 +181,31 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+     if((pte = walk(pagetable, a, 0)) == 0)
+       panic("uvmunmap: walk");
+     if((*pte & PTE_V) == 0)
+-      panic("uvmunmap: not mapped");
++      #ifndef NONE
++      if((*pte & PTE_PG) == 0)
++      #endif
++        panic("uvmunmap: not mapped");
+     if(PTE_FLAGS(*pte) == PTE_V)
+       panic("uvmunmap: not a leaf");
+-    if(do_free){
+-      uint64 pa = PTE2PA(*pte);
+-      kfree((void*)pa);
++    if(do_free && ((*pte & PTE_PG)==0)){
++        uint64 pa = PTE2PA(*pte);
++        kfree((void*)pa);
+     }
+     *pte = 0;
+-  }
++    #ifndef NONE
++      struct proc *p = myproc();
++      if(p->pid > 2) {
++        for (int i = 0; i < MAX_PSYC_PAGES; i++){
++          if(p->ram[i].adress == a) {
++            p->ram[i].adress = UNUSED;
++            p->ram[i].state= UNUSED;
++            p->swaps[i].adress = UNUSED;
++            p->swaps[i].state = UNUSED;
++          }
++        }
++      }
++    #endif
++    }
+ }
+ 
+ // create an empty user page table.
+@@ -208,7 +233,7 @@ uvminit(pagetable_t pagetable, uchar *src, uint sz)
+     panic("inituvm: more than a page");
+   mem = kalloc();
+   memset(mem, 0, PGSIZE);
+-  mappages(pagetable, 0, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U);
++  mappages(pagetable, 0, PGSIZE, (uint64)mem, PTE_W|PTE_R|PTE_X|PTE_U, REG_MAP);
+   memmove(mem, src, sz);
+ }
+ 
+@@ -231,11 +256,38 @@ uvmalloc(pagetable_t pagetable, uint64 oldsz, uint64 newsz)
+       return 0;
+     }
+     memset(mem, 0, PGSIZE);
+-    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U) != 0){
++    if(mappages(pagetable, a, PGSIZE, (uint64)mem, PTE_W|PTE_X|PTE_R|PTE_U, REG_MAP) != 0){
+       kfree(mem);
+       uvmdealloc(pagetable, a, oldsz);
+       return 0;
+     }
++    struct proc *p = myproc();
++    int ramI = -1;
++    int swapI = -1;
++    #ifndef NONE
++      if(p->pid > 2 && p->pagetable == pagetable) {
++        ramI = EmptyRoomOnRam(p);
++        // no empty room on ram
++        if(ramI == -1){
++          swapI = EmptyRoomToSwap(p);
++          //room in swap
++          if(swapI != -1) 
++            ramI  = ramIntoDisc(p, swapI);
++          else 
++            panic("Out OF Mem");
++        }  
++        p->ram[ramI].state = USED;
++        p->ram[ramI].adress = a;
++        p->ram[ramI].creationTime = createTime();
++        #if LAPA
++          p->ram[ramI].accesscounter = 0xFFFFFFFF;
++        #endif
++        #if NFUA
++          p->ram[ramI].accesscounter = 0;
++        #endif
++        p->ram[ramI].offsetInSF = ramI*PGSIZE;
++        }
++    #endif
+   }
+   return newsz;
+ }
+@@ -305,14 +357,27 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+   for(i = 0; i < sz; i += PGSIZE){
+     if((pte = walk(old, i, 0)) == 0)
+       panic("uvmcopy: pte should exist");
+-    if((*pte & PTE_V) == 0)
+-      panic("uvmcopy: page not present");
++    if((*pte & PTE_V) == 0){
++      #ifndef NONE
++        if(*pte & PTE_PG) {
++          pte_t *pte1;
++          pte1 = walk(new, i, 0);
++          *pte1 &= ~PTE_V;
++          *pte1 |= PTE_PG;
++          *pte1 |= PTE_FLAGS(*pte);
++        }
++        else
++          panic("uvmcopy: page not present");
++      #else
++        panic("uvmcopy: page not present");
++      #endif
++    }
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+     if((mem = kalloc()) == 0)
+       goto err;
+     memmove(mem, (char*)pa, PGSIZE);
+-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
++    if(mappages(new, i, PGSIZE, (uint64)mem, flags, REG_MAP) != 0){
+       kfree(mem);
+       goto err;
+     }
+@@ -429,3 +494,206 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++
++int
++ramIntoDisc(struct proc *p, int swapI)
++{
++  int ramI = findpagetoswap(p);
++  
++  uint64 pa = walkaddr(p->pagetable, p->ram[ramI].adress);
++  if(writeToSwapFile(p, (void*)pa, PGSIZE*swapI, PGSIZE) == -1)
++    panic("Fail");
++  
++  p->swaps[swapI].state = USED;
++  p->swaps[swapI].adress = p->ram[ramI].adress;
++  p->swaps[swapI].offsetInSF = swapI * PGSIZE;
++  
++  pte_t *pte;
++  pte = walk(p->pagetable, p->ram[ramI].adress, 0);
++  *pte |= PTE_PG;
++  *pte &= ~PTE_V;
++  
++  kfree((void*)pa);
++  return ramI;
++}
++
++void discIntoRam(uint64 va, pte_t *pte, char* pa, struct proc *p, int ramI){
++  int swapI = 0;
++  // find page on disc
++  for ( swapI = 0; swapI < MAX_PSYC_PAGES;swapI++)
++    if(p->swaps[swapI].adress == va) 
++      break;
++  
++  // update disk & ram  
++  p->swaps[swapI].adress = UNUSED;
++  p->swaps[swapI].state = UNUSED;
++  p->ram[ramI].adress = va;
++  p->ram[ramI].state = USED;
++  p->ram[ramI].creationTime = createTime();
++  #if LAPA
++    p->ram[ramI].accesscounter = 0xFFFFFFFF;
++  #endif
++  #if NFUA
++    p->ram[ramI].accesscounter = 0;
++  #endif
++  // read from disc
++  if(readFromSwapFile(p, global_buff, swapI*PGSIZE, PGSIZE) == -1)
++    panic("Fail");
++  
++}
++
++int EmptyRoomOnRam(struct proc* p){
++  for (int i =0 ; i<MAX_PSYC_PAGES; i++){
++    if (p->ram[i].state == 0)
++      return i;
++  }
++  return -1;
++}
++
++int EmptyRoomToSwap(struct proc* p){
++  for (int i =0 ; i<MAX_PSYC_PAGES; i++){
++    if (p->swaps[i].state == 0)
++      return i;
++  }
++  panic("no more memory");
++  return -1;
++}
++
++void pageFault(uint64 va, pte_t *pte)
++{
++  struct proc *p = myproc();
++  char *pa = kalloc();
++  int ramI = EmptyRoomOnRam(p);
++  // no empty room on ram
++  if(ramI == -1) {
++    //choose indx on ram
++    ramI = findpagetoswap(p);
++    uint ramVa = p->ram[ramI].adress;
++    uint64 ramPa = walkaddr(p->pagetable, ramVa);
++    
++    discIntoRam(va, pte, pa, p, ramI);
++    int swapI = EmptyRoomToSwap(p);
++
++    if(writeToSwapFile(p, (void*)ramPa, PGSIZE*swapI, PGSIZE) == -1)
++      panic("Fail");
++    kfree((void*)ramPa);   
++
++    p->swaps[swapI].state = USED;
++    p->swaps[swapI].adress = ramVa;
++    
++    pte_t *swapPte = walk(p->pagetable, ramVa, 0);
++    *swapPte = *swapPte | PTE_PG;
++    *swapPte = *swapPte & ~PTE_V;     
++  }
++  //Found empty room 
++  else 
++    discIntoRam(va, pte, pa, p, ramI);
++       
++  mappages(p->pagetable, va, p->sz, (uint64)pa, PTE_W | PTE_X | PTE_R | PTE_U, SPEC_MAP);
++  memmove((void*)pa, global_buff, PGSIZE);
++  *pte = *pte & ~PTE_PG;
++}
++
++ // find the page with min access to remove, now we should update it when get access , where????? and when create it the counter should be 0
++int aNFUA(){
++  int index=0;
++  int _minValue = myproc()->ram[0].accesscounter;    //take the first as comperator (first exists otherwise we won't enter this func)
++  int i;
++  for(i=0; i < MAX_PSYC_PAGES; i++){
++    if(myproc()->ram[i].accesscounter< _minValue){
++      _minValue=myproc()->ram[i].accesscounter;
++      index=i;
++    }
++  }
++  return index;
++}
++
++int countSetBits(uint n){ 
++  int count = 0; 
++  while (n){ 
++      count += n & 1;                                         //AND first bit with 1 and add result to count
++      n >>= 1;                                                //shift right one bit and continue
++  } 
++  return count; 
++}
++
++int aLAPA(){
++  uint _minValue=countSetBits( myproc()->ram[0].accesscounter);
++  int index=0;
++  int i;
++  for(i=0; i < MAX_PSYC_PAGES; i++){
++    if(countSetBits(myproc()->ram[0].accesscounter)<_minValue){
++      _minValue=countSetBits( myproc()->ram[0].accesscounter);
++      index=i;
++    }
++  }
++  return index;
++}
++
++int aSCFIFO(){
++  pte_t * pte;
++  int i = 0;
++  int pageIndex;
++  uint ctime;
++  recheck:
++  pageIndex = -1;
++  ctime =  myproc()->ram[0].creationTime;
++  for (i = 0; i < MAX_PSYC_PAGES; i++) {
++    if (myproc()->ram[i].state ==1 && myproc()->ram[i].creationTime <= ctime){
++      pageIndex = i;
++      ctime = myproc()->ram[i].creationTime;
++      }
++  }
++  pte = walk(myproc()->pagetable, myproc()->ram[pageIndex].adress,0);
++  if (*pte & PTE_A) {
++    *pte &= ~PTE_A; // turn off PTE_A flag
++
++    goto recheck;
++    }
++  return pageIndex;
++}
++
++int findpagetoswap(){
++  #if NFUA  
++   return aNFUA();
++  #endif
++
++  #if SCFIFO
++   return aSCFIFO();
++  #endif
++
++  #if LAPA
++   return aLAPA();
++  #endif
++
++  panic("Unrecognized paging algorithm");
++}
++
++void updateCounter(struct proc * p){
++  pte_t * pte;
++  int i;
++  for (i = 0; i < MAX_PSYC_PAGES; i++) {
++    if (p->ram[i].state == 1){
++      pte = walk(p->pagetable,p->ram[i].adress,0);
++      if (*pte & PTE_A) { // check if page accessed 
++        *pte &= ~PTE_A; // turn off PTE_A flag
++         p->ram[i].accesscounter = p->ram[i].accesscounter >> 1;
++         p->ram[i].accesscounter = p->ram[i].accesscounter | (1 << 31);
++
++      }
++    } 
++  }
++}
++struct spinlock lock;
++int next = 1;
++
++int createTime() {
++  int time;
++  if(next < 2)
++    initlock(&lock, "nextctime");
++  acquire(&lock);
++  time = next;
++  next ++;
++  release(&lock);
++  return time;
++}
+diff --git a/user/test.c b/user/test.c
+new file mode 100644
+index 0000000..82b9378
+--- /dev/null
++++ b/user/test.c
+@@ -0,0 +1,78 @@
++#include "kernel/types.h"
++#include "user/user.h"
++
++#define PGSIZE 4096
++#include "kernel/param.h"
++//#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fs.h"
++#include "kernel/fcntl.h"
++#include "kernel/syscall.h"
++#include "kernel/memlayout.h"
++#include "kernel/riscv.h"
++
++char * memoryarray[22];
++void test1()
++{
++    int pid;
++    if((pid=fork()) == 0)    {
++        char *mem = sbrk(20 * PGSIZE);
++        mem[5000] = 0;
++        mem[4069 * 20] = 0;
++        sleep(100);
++        exit(0);
++    }
++    wait(0);
++   printf("--------- Test1 finished ---------\n");
++}
++
++void test2()
++{
++  if(fork()!=0){
++    printf("we in parent process\n");
++    wait(0); // we should wait the child to finish
++  }
++  else
++  {
++    printf("we in child process\n");
++  }
++   printf("--------- Test2 finished ---------\n");
++}
++//copying pages into children
++void test3(){
++  
++    if (fork() == 0)
++    {
++        sbrk(20*4096);
++        if (fork() == 0)
++        {
++            if (fork() == 0)
++            {
++                if (fork() == 0)
++            wait(0);
++                exit(0);
++            }
++            wait(0);
++            exit(0);
++        }
++        wait(0);
++        exit(0);
++    }
++    wait(0);
++   printf("--------- Test3 finished ---------\n");
++}
++
++char in[3];
++int *pages[18];
++
++int main(int argc, char *argv[])
++{
++  printf("--------- Test1 Started ---------\n");
++   test1();
++  printf("--------- Test2 Started ---------\n");
++   test2();
++   printf("--------- Test3 Started ---------\n");
++   test3();
++    exit(0);
++}
+\ No newline at end of file
